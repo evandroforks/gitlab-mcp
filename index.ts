@@ -16181,7 +16181,8 @@ async function startStreamableHTTPServer(): Promise<void> {
   // names such as "constructor" from masquerading as live transports.
   const streamableTransports: Record<string, StreamableTransport> = Object.create(null);
 
-  const authTimeouts: Record<string, NodeJS.Timeout> = {};
+  const sessionTimeouts: Record<string, NodeJS.Timeout> = {};
+  const activeSessionResponses: Record<string, number> = Object.create(null);
 
   // Configuration and limits
   const MAX_SESSIONS = Number.parseInt(process.env.MAX_SESSIONS || "1000", 10);
@@ -16447,7 +16448,7 @@ async function startStreamableHTTPServer(): Promise<void> {
     if (options?.skipIfUnchanged && current && sessionAuthTokensMatch(current, authData)) {
       authBySession[targetSessionId].lastUsed = Date.now();
       updateSessionPublicBaseUrl(targetSessionId, publicBaseUrl);
-      setAuthTimeout(targetSessionId);
+      setSessionTimeout(targetSessionId);
       return "unchanged";
     }
     if (!(await validateAuthDataUpstream(authData))) {
@@ -16458,31 +16459,30 @@ async function startStreamableHTTPServer(): Promise<void> {
       publicBaseUrl,
       existing ?? current
     );
-    setAuthTimeout(targetSessionId);
+    setSessionTimeout(targetSessionId);
     return "stored";
   };
 
   /**
-   * Set or reset timeout for session auth.
-   * After SESSION_TIMEOUT_SECONDS of inactivity, the auth token is removed
-   * and the Streamable HTTP transport is closed so the session slot is released.
+   * Expire idle stateful sessions regardless of where their GitLab token is stored.
+   * An in-flight response (including a GET SSE stream) is activity, not inactivity.
    */
-  const setAuthTimeout = (sessionId: string) => {
-    // Clear existing timeout if any
-    clearAuthTimeout(sessionId);
+  const setSessionTimeout = (sessionId: string) => {
+    clearSessionTimeout(sessionId);
+    if (!streamableTransports[sessionId] || activeSessionResponses[sessionId]) return;
 
     // Set new timeout
-    authTimeouts[sessionId] = setTimeout(() => {
+    sessionTimeouts[sessionId] = setTimeout(() => {
       const authData = authBySession[sessionId];
       const transport = streamableTransports[sessionId];
       if (authData || transport) {
         logger.info(
           authData
             ? `Session ${redactSessionIdForLog(sessionId)}: auth token expired after ${SESSION_TIMEOUT_SECONDS}s of inactivity`
-            : `Session ${redactSessionIdForLog(sessionId)}: unauthenticated discovery expired after ${SESSION_TIMEOUT_SECONDS}s`
+            : `Session ${redactSessionIdForLog(sessionId)}: expired after ${SESSION_TIMEOUT_SECONDS}s of inactivity`
         );
         delete authBySession[sessionId];
-        delete authTimeouts[sessionId];
+        delete sessionTimeouts[sessionId];
         metrics.expiredSessions++;
         // Close the transport to free the slot; without this, stale sessions accumulate and exhaust MAX_SESSIONS.
         if (transport) {
@@ -16498,14 +16498,41 @@ async function startStreamableHTTPServer(): Promise<void> {
   };
 
   /**
-   * Clear timeout for session auth
+   * Clear the session inactivity timeout
    */
-  const clearAuthTimeout = (sessionId: string) => {
-    const timeout = authTimeouts[sessionId];
+  const clearSessionTimeout = (sessionId: string) => {
+    const timeout = sessionTimeouts[sessionId];
     if (timeout) {
       clearTimeout(timeout);
-      delete authTimeouts[sessionId];
+      delete sessionTimeouts[sessionId];
     }
+  };
+
+  // Track the HTTP response rather than handleRequest's promise: the SDK can
+  // resolve that promise while an SSE response is still open. Concurrent POSTs
+  // must not rearm expiry while another response still uses the session.
+  // Start only after authentication and body parsing: an incomplete upload or
+  // pending credential validation has not yet been admitted to the MCP session.
+  const trackSessionResponse = (sessionId: string, res: Response) => {
+    clearSessionTimeout(sessionId);
+    activeSessionResponses[sessionId] = (activeSessionResponses[sessionId] ?? 0) + 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      res.off("finish", release);
+      res.off("close", release);
+      const remaining = (activeSessionResponses[sessionId] ?? 0) - 1;
+      if (remaining > 0) {
+        activeSessionResponses[sessionId] = remaining;
+      } else {
+        delete activeSessionResponses[sessionId];
+        setSessionTimeout(sessionId);
+      }
+    };
+    res.once("finish", release);
+    res.once("close", release);
+    if (res.writableEnded || res.destroyed) release();
   };
 
   /**
@@ -16514,7 +16541,7 @@ async function startStreamableHTTPServer(): Promise<void> {
   const cleanupSessionAuth = (sessionId: string) => {
     delete authBySession[sessionId];
     delete sessionOwners[sessionId];
-    clearAuthTimeout(sessionId);
+    clearSessionTimeout(sessionId);
   };
 
   /**
@@ -16532,7 +16559,7 @@ async function startStreamableHTTPServer(): Promise<void> {
    *   3. We assign `transport.sessionId = <sealed>` so the SDK emits the
    *      Mcp-Session-Id response header for the client to echo back.
    *   4. The AsyncLocalStorage auth context is populated from the derived
-   *      auth, bypassing authBySession / authTimeouts entirely.
+   *      auth, bypassing authBySession / sessionTimeouts entirely.
    *
    * Rate limiting is explicitly disabled in stateless mode (per-pod counters
    * would yield a loose global bound — operators can rate-limit upstream).
@@ -16683,7 +16710,7 @@ async function startStreamableHTTPServer(): Promise<void> {
     // Always mint a fresh sid so the embedded iat advances on every request.
     // This makes OAUTH_STATELESS_SESSION_TTL_SECONDS behave as an inactivity
     // timeout rather than an absolute-age cap — matching the legacy
-    // setAuthTimeout semantics. Reusing the incoming sid would regress
+    // setSessionTimeout semantics. Reusing the incoming sid would regress
     // long-lived sessions that authenticate via sealed-sid replay (typical
     // REMOTE_AUTHORIZATION flow after init).
     const freshSid = mintSessionId(material, {
@@ -17065,6 +17092,9 @@ async function startStreamableHTTPServer(): Promise<void> {
     mcpBearerAuth,
     rejectForeignSession,
     mcpJsonBodyParser,
+    // Authentication/body parsing can outlast the idle timeout. Recheck before
+    // touching per-session auth or rate counters for a session that has closed.
+    rejectUnknownStatefulSession,
     async (req: Request, res: Response) => {
       const sessionId = readMcpSessionIdHeader(req);
       const publicBaseUrl = getForwardedPublicBaseUrl(req, MCP_TRUST_PROXY);
@@ -17179,7 +17209,7 @@ async function startStreamableHTTPServer(): Promise<void> {
             }
           } else if (allowUnauthenticatedDiscovery) {
             // Schedule cleanup for unauthenticated discovery sessions to prevent slot exhaustion
-            setAuthTimeout(sessionId);
+            setSessionTimeout(sessionId);
           }
         } else if (sessionId && authData) {
           const allowedProjectIds = bindSessionProjectScope(
@@ -17219,7 +17249,7 @@ async function startStreamableHTTPServer(): Promise<void> {
           // Existing session with stored auth: update last used time and reset timeout
           authBySession[sessionId].lastUsed = Date.now();
           updateSessionPublicBaseUrl(sessionId, publicBaseUrl);
-          setAuthTimeout(sessionId);
+          setSessionTimeout(sessionId);
         } else if (!sessionId && !authData) {
           // First request without session - will fail in initialization
         }
@@ -17240,7 +17270,7 @@ async function startStreamableHTTPServer(): Promise<void> {
               logger.info(
                 `Session ${redactSessionIdForLog(sessionId)}: stored ${headerAuthData.header} header (header auth)`
               );
-              setAuthTimeout(sessionId);
+              setSessionTimeout(sessionId);
             } else {
               const allowedProjectIds = bindSessionProjectScope(
                 headerAuthData.allowedProjectIds,
@@ -17256,7 +17286,7 @@ async function startStreamableHTTPServer(): Promise<void> {
                 publicBaseUrl,
                 authBySession[sessionId]
               );
-              setAuthTimeout(sessionId);
+              setSessionTimeout(sessionId);
             }
           }
         } else {
@@ -17274,13 +17304,13 @@ async function startStreamableHTTPServer(): Promise<void> {
               logger.info(
                 `Session ${redactSessionIdForLog(sessionId)}: stored OAuth token (client: ${authInfo.clientId})`
               );
-              setAuthTimeout(sessionId);
+              setSessionTimeout(sessionId);
             } else {
               // Update token on every request — the client may have refreshed it
               authBySession[sessionId].token = authInfo.token;
               authBySession[sessionId].lastUsed = Date.now();
               updateSessionPublicBaseUrl(sessionId, publicBaseUrl);
-              setAuthTimeout(sessionId);
+              setSessionTimeout(sessionId);
             }
           }
         }
@@ -17294,14 +17324,20 @@ async function startStreamableHTTPServer(): Promise<void> {
           if (sessionId && streamableTransports[sessionId]) {
             // Reuse existing transport for ongoing session
             transport = streamableTransports[sessionId];
-
+            trackSessionResponse(sessionId, res);
             await transport.handleRequest(req, res, req.body);
+          } else if (sessionId) {
+            // The session may have expired while an upstream auth check awaited.
+            cleanupSessionAuth(sessionId);
+            delete sessionRequestCounts[sessionId];
+            res.status(404).json({ error: "Session not found" });
           } else {
             // Create new transport for new session
             transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => randomUUID(),
               onsessioninitialized: (newSessionId: string) => {
                 streamableTransports[newSessionId] = transport;
+                trackSessionResponse(newSessionId, res);
                 metrics.totalSessions++;
                 metrics.activeSessions++;
                 logger.warn(
@@ -17316,9 +17352,9 @@ async function startStreamableHTTPServer(): Promise<void> {
                     logger.info(
                       `Session ${redactSessionIdForLog(newSessionId)}: stored ${authData.header} header`
                     );
-                    setAuthTimeout(newSessionId);
+                    setSessionTimeout(newSessionId);
                   } else if (unauthenticatedDiscoveryRequested) {
-                    setAuthTimeout(newSessionId);
+                    setSessionTimeout(newSessionId);
                   }
                 }
 
@@ -17333,7 +17369,7 @@ async function startStreamableHTTPServer(): Promise<void> {
                       logger.info(
                         `Session ${redactSessionIdForLog(newSessionId)}: stored ${authData.header} header (header auth)`
                       );
-                      setAuthTimeout(newSessionId);
+                      setSessionTimeout(newSessionId);
                     }
                   } else {
                     const authInfo = req.auth;
@@ -17349,7 +17385,7 @@ async function startStreamableHTTPServer(): Promise<void> {
                       logger.info(
                         `Session ${redactSessionIdForLog(newSessionId)}: stored OAuth token (client: ${authInfo.clientId})`
                       );
-                      setAuthTimeout(newSessionId);
+                      setSessionTimeout(newSessionId);
                     }
                   }
                 }
@@ -17364,10 +17400,11 @@ async function startStreamableHTTPServer(): Promise<void> {
                   `Streamable HTTP transport closed for session ${redactSessionIdForLog(sid)}, cleaning up`
                 );
                 delete streamableTransports[sid];
+                delete activeSessionResponses[sid];
                 metrics.activeSessions--;
+                cleanupSessionAuth(sid);
+                delete sessionRequestCounts[sid];
                 if (REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) {
-                  cleanupSessionAuth(sid);
-                  delete sessionRequestCounts[sid];
                   logger.info(`Session ${redactSessionIdForLog(sid)}: cleaned up auth mapping`);
                 }
               }
@@ -17465,15 +17502,10 @@ async function startStreamableHTTPServer(): Promise<void> {
 
       metrics.requestsProcessed++;
 
-      const usesSessionTimeouts = REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH;
-      if (usesSessionTimeouts) {
-        if (authBySession[sessionId]) {
-          authBySession[sessionId].lastUsed = Date.now();
-        }
-        // Listening on GET /mcp is session activity. Pause inactivity expiry for
-        // the life of the SSE stream so list_changed can still be pushed.
-        clearAuthTimeout(sessionId);
+      if (authBySession[sessionId]) {
+        authBySession[sessionId].lastUsed = Date.now();
       }
+      trackSessionResponse(sessionId, res);
 
       const handleGetRequest = async () => {
         try {
@@ -17489,26 +17521,20 @@ async function startStreamableHTTPServer(): Promise<void> {
         }
       };
 
-      try {
-        if (usesSessionTimeouts && authBySession[sessionId]) {
-          const authData = authBySession[sessionId];
-          const ctx: SessionAuth = {
-            sessionId,
-            header: authData.header,
-            token: authData.token,
-            lastUsed: authData.lastUsed,
-            apiUrl: authData.apiUrl,
-            publicBaseUrl: authData.publicBaseUrl,
-            allowedProjectIds: authData.allowedProjectIds,
-          };
-          await sessionAuthStore.run(ctx, handleGetRequest);
-        } else {
-          await handleGetRequest();
-        }
-      } finally {
-        if (usesSessionTimeouts && streamableTransports[sessionId]) {
-          setAuthTimeout(sessionId);
-        }
+      if (authBySession[sessionId]) {
+        const authData = authBySession[sessionId];
+        const ctx: SessionAuth = {
+          sessionId,
+          header: authData.header,
+          token: authData.token,
+          lastUsed: authData.lastUsed,
+          apiUrl: authData.apiUrl,
+          publicBaseUrl: authData.publicBaseUrl,
+          allowedProjectIds: authData.allowedProjectIds,
+        };
+        await sessionAuthStore.run(ctx, handleGetRequest);
+      } else {
+        await handleGetRequest();
       }
     }
   );
@@ -17646,8 +17672,8 @@ async function startStreamableHTTPServer(): Promise<void> {
     await Promise.allSettled(closePromises);
 
     // Clear all timeouts
-    Object.keys(authTimeouts).forEach(sessionId => {
-      clearAuthTimeout(sessionId);
+    Object.keys(sessionTimeouts).forEach(sessionId => {
+      clearSessionTimeout(sessionId);
     });
 
     clientPool.closeAll();

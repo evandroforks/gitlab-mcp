@@ -3,6 +3,10 @@
 # hanging the multi-platform CI build until the job timeout.
 FROM node:22.21.1-bookworm-slim AS builder
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . /app
 COPY tsconfig.json /tsconfig.json
 

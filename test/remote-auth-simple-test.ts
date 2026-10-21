@@ -5,6 +5,8 @@
 
 import { describe, test, after, before } from 'node:test';
 import assert from 'node:assert';
+import { once } from 'node:events';
+import { request } from 'node:http';
 import {
   launchServer,
   findAvailablePort,
@@ -270,6 +272,61 @@ describe('Remote Authorization - Session Timeout', () => {
     }
   });
 
+  test('returns 404 when a SID-only POST expires while its body is arriving', async () => {
+    const initialized = await fetch(mcpUrl, {
+      method: 'POST',
+      headers: {
+        'Private-Token': MOCK_TOKEN,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: {
+          protocolVersion: '2025-03-26', capabilities: {},
+          clientInfo: { name: 'partial-body-test', version: '1.0.0' },
+        },
+      }),
+    });
+    assert.strictEqual(initialized.status, 200);
+    const sid = initialized.headers.get('mcp-session-id');
+    assert.ok(sid);
+    await initialized.text();
+    const beforeTimeout = await getMetrics(mcpUrl);
+    assert.ok(beforeTimeout.activeSessions > 0);
+    assert.ok(beforeTimeout.authenticatedSessions > 0);
+
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'ping' });
+    const upload = request(mcpUrl, {
+      method: 'POST',
+      headers: {
+        'Mcp-Session-Id': sid,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        Expect: '100-continue',
+        Accept: 'application/json, text/event-stream',
+      },
+    });
+    const response = once(upload, 'response', { signal: AbortSignal.timeout(10_000) });
+    try {
+      const continued = once(upload, 'continue', { signal: AbortSignal.timeout(5000) });
+      upload.flushHeaders();
+      await continued;
+      upload.write(body.slice(0, -1));
+      await new Promise(resolve => setTimeout(resolve, TIMEOUT_TEST_WAIT_MS));
+      await waitForSessionDecrease(mcpUrl, beforeTimeout);
+      upload.end(body.slice(-1));
+      const [result] = await response;
+      assert.strictEqual(result.statusCode, 404);
+      let received = '';
+      for await (const chunk of result) received += chunk;
+      assert.deepStrictEqual(JSON.parse(received), { error: 'Session not found' });
+    } finally {
+      upload.destroy();
+      await response.catch(() => undefined);
+    }
+  });
+
   test('session timeout verification - activity keeps session alive', async () => {
     const client = new CustomHeaderClient({
       'authorization': `Bearer ${MOCK_TOKEN}`
@@ -326,6 +383,10 @@ describe('Remote Authorization - Session Timeout', () => {
       'Session should add one authenticated session'
     );
 
+    // Closing the client drops its GET SSE stream without sending DELETE.
+    // An open SSE response is activity, so abandon it before testing inactivity.
+    await clientWithAuth.disconnect();
+
     // Step 2: Wait for timeout WITHOUT making any requests
     console.log(`  ⏳ Waiting ${TIMEOUT_TEST_WAIT_MS/1000}s for timeout without activity...`);
     await new Promise(resolve => setTimeout(resolve, TIMEOUT_TEST_WAIT_MS));
@@ -338,6 +399,7 @@ describe('Remote Authorization - Session Timeout', () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
         'mcp-session-id': sessionId,
       },
       body: JSON.stringify({
