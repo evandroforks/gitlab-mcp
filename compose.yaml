@@ -17,6 +17,7 @@ services:
       PORT: "3002"
       STREAMABLE_HTTP: "true"
       REMOTE_AUTHORIZATION: "true"
+      GITLAB_TOOLSETS: core,merge_requests
       GITLAB_API_URL: ${GITLAB_API_URL:?Set the fixed GitLab API URL in .env}
       ENABLE_DYNAMIC_API_URL: "false"
       ENABLE_DYNAMIC_PROJECT_SCOPE: "false"
