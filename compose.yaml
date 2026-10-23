@@ -18,6 +18,7 @@ services:
       STREAMABLE_HTTP: "true"
       REMOTE_AUTHORIZATION: "true"
       GITLAB_TOOLSETS: core,merge_requests
+      GITLAB_TOOLS: list_pipelines,get_pipeline,list_pipeline_jobs,get_pipeline_job,get_pipeline_job_output,get_pipeline_test_report,get_pipeline_test_report_summary,list_job_artifacts,get_job_artifact_file
       GITLAB_API_URL: ${GITLAB_API_URL:?Set the fixed GitLab API URL in .env}
       ENABLE_DYNAMIC_API_URL: "false"
       ENABLE_DYNAMIC_PROJECT_SCOPE: "false"
